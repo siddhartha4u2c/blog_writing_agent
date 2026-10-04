@@ -1,8 +1,10 @@
+import io
 import json
 import os
 import re
 import sys
 import types
+import zipfile
 from pathlib import Path
 
 import streamlit as st
@@ -73,6 +75,32 @@ def make_image_filenames_safe(specs):
     for spec in specs:
         filename = str(spec.get("filename", "diagram.png")).replace("\\", "/")
         spec["filename"] = Path(filename).name or "diagram.png"
+
+
+LOCAL_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\((images/[^)\s]+)\)")
+
+
+def render_blog(markdown):
+    # The browser cannot load images/<file> from the server's disk, so each
+    # local image is sent through st.image and the text around it as Markdown.
+    parts = LOCAL_IMAGE_PATTERN.split(markdown)
+    for index, part in enumerate(parts):
+        if index % 2 == 0:
+            if part.strip():
+                st.markdown(part)
+        elif Path(part).is_file():
+            st.image(part)
+        else:
+            st.warning(f"Image file not found: {part}")
+
+
+def blog_zip(title, markdown, image_paths):
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(f"{title}.md", markdown)
+        for path in image_paths:
+            archive.write(path, path.as_posix())
+    return buffer.getvalue()
 
 
 REVISE_OUTLINE_INSTRUCTIONS = """A reviewer rejected the current outline. Revise it to apply their feedback.
@@ -394,10 +422,22 @@ if stage == "done":
     state = st.session_state.workflow
     title = safe_title(state["plan"].blog_title)
     st.success(f"Saved {title}.md in {Path.cwd()}")
-    st.download_button(
+    final_blog = st.session_state.final_blog
+    image_paths = [Path(path) for path in dict.fromkeys(LOCAL_IMAGE_PATTERN.findall(final_blog))]
+    image_paths = [path for path in image_paths if path.is_file()]
+
+    markdown_col, zip_col = st.columns(2)
+    markdown_col.download_button(
         "Download Markdown",
-        data=st.session_state.final_blog,
+        data=final_blog,
         file_name=f"{title}.md",
         mime="text/markdown",
     )
-    st.markdown(st.session_state.final_blog)
+    if image_paths:
+        zip_col.download_button(
+            "Download Markdown with images (.zip)",
+            data=blog_zip(title, final_blog, image_paths),
+            file_name=f"{title}.zip",
+            mime="application/zip",
+        )
+    render_blog(final_blog)
