@@ -35,7 +35,7 @@ TAVILY_API_KEY=your-tavily-key
 streamlit run streamlit_app.py
 ```
 
-Enter a topic, approve the outline, edit the draft if you want, then approve it. The final post is saved as `<blog title>.md` in the directory you launched the app from, with its diagrams in `images/`.
+Enter a topic, approve the outline, edit the draft if you want, then approve it. Both review steps also have a reject button: rejecting the outline returns you to the topic step, and rejecting the draft discards it and returns you to the outline. Nothing is saved on a reject. The final post is saved as `<blog title>.md` in the directory you launched the app from, with its diagrams in `images/`.
 
 You can also run the agent directly from `blog_research_writing_agent_with_image.ipynb`. The Streamlit app loads its pipeline from that notebook, so keep the two files together.
 

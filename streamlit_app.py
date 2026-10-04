@@ -75,8 +75,99 @@ def make_image_filenames_safe(specs):
         spec["filename"] = Path(filename).name or "diagram.png"
 
 
+REVISE_OUTLINE_INSTRUCTIONS = """A reviewer rejected the current outline. Revise it to apply their feedback.
+
+Rules:
+- Apply the feedback fully, even where it overrides the section-count or word-count defaults.
+- Keep everything the feedback does not touch as it is.
+- Number task ids from 1 in reading order.
+"""
+
+REVISE_DRAFT_SYSTEM = """You are a senior technical editor.
+A reviewer rejected the current Markdown draft of a blog post. Revise it to apply their feedback.
+
+Rules:
+- Apply the feedback fully.
+- Keep everything the feedback does not touch as it is, including the H1 title, code blocks and source links.
+- Keep every [[IMAGE_n]] placeholder exactly as written, unless the feedback asks to remove that image.
+- Do not invent sources or URLs.
+- Output ONLY the full revised Markdown, with no commentary and no code fence around the whole document.
+"""
+
+
+def message_text(message):
+    content = message.content
+    if isinstance(content, str):
+        return content
+    return "".join(
+        block.get("text", "") if isinstance(block, dict) else str(block) for block in content
+    )
+
+
+def strip_outer_fence(markdown):
+    match = re.fullmatch(r"\s*```(?:markdown|md)?\s*\n(.*)\n```\s*", markdown, re.DOTALL)
+    return match.group(1) if match else markdown
+
+
+def revise_outline(pipeline, state, feedback):
+    planner = pipeline["llm"].with_structured_output(pipeline["Plan"])
+    evidence = [item.model_dump() for item in state.get("evidence", [])][:16]
+    plan = planner.invoke(
+        [
+            pipeline["SystemMessage"](content=pipeline["ORCH_SYSTEM"]),
+            pipeline["HumanMessage"](
+                content=(
+                    f"Topic: {state['topic']}\n"
+                    f"Mode: {state['mode']}\n\n"
+                    f"Evidence (ONLY use for fresh claims; may be empty):\n{evidence}\n\n"
+                    f"{REVISE_OUTLINE_INSTRUCTIONS}\n"
+                    f"Current outline:\n{state['plan'].model_dump_json(indent=2)}\n\n"
+                    f"Reviewer feedback:\n{feedback}"
+                )
+            ),
+        ]
+    )
+    for task_id, task in enumerate(plan.tasks, start=1):
+        task.id = task_id
+    return plan
+
+
+def revise_draft(pipeline, state, draft, feedback):
+    evidence_text = "\n".join(
+        f"- {item.title} | {item.url}" for item in state.get("evidence", [])[:20]
+    )
+    result = pipeline["llm"].invoke(
+        [
+            pipeline["SystemMessage"](content=REVISE_DRAFT_SYSTEM),
+            pipeline["HumanMessage"](
+                content=(
+                    f"Topic: {state['topic']}\n"
+                    f"Audience: {state['plan'].audience}\n"
+                    f"Tone: {state['plan'].tone}\n\n"
+                    f"Evidence (ONLY use these URLs when citing):\n{evidence_text}\n\n"
+                    f"Reviewer feedback:\n{feedback}\n\n"
+                    f"Current draft:\n{draft}"
+                )
+            ),
+        ]
+    )
+    revised = strip_outer_fence(message_text(result)).strip()
+    if not revised:
+        raise RuntimeError("The model returned an empty draft.")
+    return revised + "\n"
+
+
 def reset_workflow():
-    for key in ("workflow", "workflow_stage", "draft_editor", "final_blog"):
+    for key in (
+        "workflow",
+        "workflow_stage",
+        "draft_editor",
+        "final_blog",
+        "outline_rejecting",
+        "outline_feedback",
+        "draft_rejecting",
+        "draft_feedback",
+    ):
         st.session_state.pop(key, None)
     st.rerun()
 
@@ -96,6 +187,14 @@ with st.sidebar:
         reset_workflow()
 
 stage = st.session_state.get("workflow_stage", "topic")
+
+notice = st.session_state.pop("notice", None)
+if notice:
+    st.warning(notice)
+
+revised_notice = st.session_state.pop("revised_notice", None)
+if revised_notice:
+    st.success(revised_notice)
 
 if stage == "topic":
     topic = st.text_input("Blog topic", placeholder="For example: QKV attention in Python")
@@ -137,9 +236,46 @@ if stage == "outline":
             st.markdown("\n".join(f"- {bullet}" for bullet in task.bullets))
             st.caption(f"Target: {task.target_words} words")
 
-    if st.button("Approve outline and continue", type="primary"):
-        st.session_state.workflow_stage = "draft"
-        st.rerun()
+    if st.session_state.get("outline_rejecting"):
+        with st.form("outline_feedback_form"):
+            feedback = st.text_area(
+                "What should change in the outline?",
+                placeholder="For example: drop the security section and add one on benchmarking.",
+                key="outline_feedback",
+            )
+            revise_col, discard_col, cancel_col = st.columns(3)
+            revise = revise_col.form_submit_button("Revise outline with feedback", type="primary")
+            discard = discard_col.form_submit_button("Discard and start over")
+            cancel = cancel_col.form_submit_button("Cancel")
+
+        if revise:
+            if not feedback.strip():
+                st.error("Enter feedback to revise the outline, or discard it to start over.")
+            else:
+                try:
+                    with st.spinner("Revising the outline with your feedback..."):
+                        state["plan"] = revise_outline(load_pipeline(), state, feedback.strip())
+                    st.session_state.workflow = state
+                    st.session_state.pop("outline_rejecting", None)
+                    st.session_state.pop("outline_feedback", None)
+                    st.session_state.revised_notice = "Outline revised with your feedback. Approve it or reject it again."
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not revise the outline: {exc}")
+        if discard:
+            st.session_state.notice = f"Outline for \"{state['topic']}\" rejected. Nothing was saved."
+            reset_workflow()
+        if cancel:
+            st.session_state.pop("outline_rejecting", None)
+            st.rerun()
+    else:
+        approve_col, reject_col = st.columns(2)
+        if approve_col.button("Approve outline and continue", type="primary"):
+            st.session_state.workflow_stage = "draft"
+            st.rerun()
+        if reject_col.button("Reject outline"):
+            st.session_state.outline_rejecting = True
+            st.rerun()
 
 if stage == "draft":
     state = st.session_state.workflow
@@ -186,22 +322,73 @@ if stage == "draft":
     if output_path.exists():
         overwrite = st.checkbox(f"Overwrite {output_path.name}")
 
-    if st.button(
-        "Approve and write final blog",
-        type="primary",
-        disabled=not draft.strip() or (output_path.exists() and not overwrite),
-    ):
-        try:
-            state["plan"] = state["plan"].model_copy(update={"blog_title": title})
-            state["md_with_placeholders"] = draft
-            make_image_filenames_safe(state.get("image_specs", []))
-            with st.spinner("Generating approved images and saving the blog..."):
-                result = pipeline["generate_and_place_images"](state)
-            st.session_state.final_blog = result["final"]
-            st.session_state.workflow_stage = "done"
+    if st.session_state.get("draft_rejecting"):
+        with st.form("draft_feedback_form"):
+            feedback = st.text_area(
+                "What should change in the draft?",
+                placeholder="For example: shorten the introduction and add a code example to section 3.",
+                key="draft_feedback",
+            )
+            revise_col, discard_col, cancel_col = st.columns(3)
+            revise = revise_col.form_submit_button("Revise draft with feedback", type="primary")
+            discard = discard_col.form_submit_button("Discard draft and return to outline")
+            cancel = cancel_col.form_submit_button("Cancel")
+
+        if revise:
+            if not feedback.strip():
+                st.error("Enter feedback to revise the draft, or discard it to return to the outline.")
+            elif not draft.strip():
+                st.error("The draft is empty, so there is nothing to revise.")
+            else:
+                try:
+                    with st.spinner("Revising the draft with your feedback..."):
+                        revised = revise_draft(pipeline, state, draft, feedback.strip())
+                    state["md_with_placeholders"] = revised
+                    state["image_specs"] = [
+                        spec for spec in state.get("image_specs", []) if spec["placeholder"] in revised
+                    ]
+                    st.session_state.workflow = state
+                    st.session_state.pop("draft_editor", None)
+                    st.session_state.pop("draft_rejecting", None)
+                    st.session_state.pop("draft_feedback", None)
+                    st.session_state.revised_notice = "Draft revised with your feedback. Approve it or reject it again."
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not revise the draft: {exc}")
+        if discard:
+            state.update(sections=[], merged_md="", md_with_placeholders="", image_specs=[])
+            st.session_state.workflow = state
+            st.session_state.pop("draft_editor", None)
+            st.session_state.pop("draft_rejecting", None)
+            st.session_state.pop("draft_feedback", None)
+            st.session_state.workflow_stage = "outline"
+            st.session_state.notice = "Draft rejected. Nothing was saved. Approve the outline to write a new draft, or reject it to change it."
             st.rerun()
-        except Exception as exc:
-            st.error(f"Could not save the blog: {exc}")
+        if cancel:
+            st.session_state.pop("draft_rejecting", None)
+            st.rerun()
+    else:
+        approve_col, reject_col = st.columns(2)
+        if reject_col.button("Reject draft"):
+            st.session_state.draft_rejecting = True
+            st.rerun()
+
+        if approve_col.button(
+            "Approve and write final blog",
+            type="primary",
+            disabled=not draft.strip() or (output_path.exists() and not overwrite),
+        ):
+            try:
+                state["plan"] = state["plan"].model_copy(update={"blog_title": title})
+                state["md_with_placeholders"] = draft
+                make_image_filenames_safe(state.get("image_specs", []))
+                with st.spinner("Generating approved images and saving the blog..."):
+                    result = pipeline["generate_and_place_images"](state)
+                st.session_state.final_blog = result["final"]
+                st.session_state.workflow_stage = "done"
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not save the blog: {exc}")
 
 if stage == "done":
     state = st.session_state.workflow
